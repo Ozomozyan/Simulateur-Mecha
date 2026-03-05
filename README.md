@@ -45,3 +45,9 @@ Pour arrêter les services :
 ```bash
 docker compose down
 ```
+
+Pour generer events et refresh KPI views :
+
+```bash
+.\run_demo.ps1
+```
