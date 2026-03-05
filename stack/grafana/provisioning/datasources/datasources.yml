@@ -1,0 +1,26 @@
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    jsonData:
+      version: Flux
+      organization: mecha
+      defaultBucket: telemetry
+    secureJsonData:
+      token: mecha-super-token
+
+  - name: Postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: mecha
+    user: mecha
+    secureJsonData:
+      password: mecha
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
