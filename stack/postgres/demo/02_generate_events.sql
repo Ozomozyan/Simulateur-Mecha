@@ -1,8 +1,10 @@
 -- Phase 6.2 — Génération d'events Postgres (7 derniers jours)
+-- Scope étendu à 5 usines
 -- Production: par minute (06:00-22:00), uniquement sur machines CNC
--- Anomalies:
---  - FR CNC-01: scrap rate augmente progressivement + cycle time dérive
---  - ES CNC-02: arrêts récurrents + un gros arrêt + maintenance corrélée
+-- Histoire métier:
+--  - FR_TLS / CNC-01: dérive qualité progressive + cycle time qui dérive
+--  - ES_ZAZ / CNC-02: arrêts récurrents + arrêt majeur + maintenance corrélée
+--  - FR_LYO / FR_LIL / ES_VLC: usines de référence plus saines, avec quelques micro-arrêts réalistes
 
 BEGIN;
 
@@ -20,7 +22,7 @@ WITH params AS (
 
 -- 2) Fenêtres d'arrêts (downtime) synthétiques
 downtime_windows AS (
-  -- ES CNC-02: arrêts quotidiens (lube) + arrêt majeur (mech fault)
+  -- ES_ZAZ / CNC-02: arrêts quotidiens (lube) + arrêt majeur (mech fault)
   SELECT
     (d + time '09:30')::timestamptz AS start_ts,
     (d + time '09:45')::timestamptz AS end_ts,
@@ -48,11 +50,38 @@ downtime_windows AS (
   FROM params p
 
   UNION ALL
-  -- FR: petits arrêts courts (CNC-02) pour rendre le cockpit réaliste
+  -- FR_TLS: petits arrêts courts sur CNC-02 pour rendre le cockpit réaliste
   SELECT
     (d + time '11:20')::timestamptz,
     (d + time '11:27')::timestamptz,
     'PLANT_FR_TLS','LINE_FR_A_PM','PLANT_FR_TLS_CNC-02','UNPLANNED_STOP'
+  FROM params p
+  CROSS JOIN generate_series(date_trunc('day', p.start_ts), date_trunc('day', p.end_ts), interval '1 day') d
+
+  UNION ALL
+  -- FR_LYO: usine saine avec petit arrêt court quotidien
+  SELECT
+    (d + time '13:05')::timestamptz,
+    (d + time '13:13')::timestamptz,
+    'PLANT_FR_LYO','LINE_FR_C_PM','PLANT_FR_LYO_CNC-02','UNPLANNED_STOP'
+  FROM params p
+  CROSS JOIN generate_series(date_trunc('day', p.start_ts), date_trunc('day', p.end_ts), interval '1 day') d
+
+  UNION ALL
+  -- FR_LIL: usine saine avec petit arrêt court quotidien
+  SELECT
+    (d + time '10:40')::timestamptz,
+    (d + time '10:46')::timestamptz,
+    'PLANT_FR_LIL','LINE_FR_D_PM','PLANT_FR_LIL_CNC-02','UNPLANNED_STOP'
+  FROM params p
+  CROSS JOIN generate_series(date_trunc('day', p.start_ts), date_trunc('day', p.end_ts), interval '1 day') d
+
+  UNION ALL
+  -- ES_VLC: petite alerte lubrification quotidienne
+  SELECT
+    (d + time '12:15')::timestamptz,
+    (d + time '12:24')::timestamptz,
+    'PLANT_ES_VLC','LINE_ES_E_PM','PLANT_ES_VLC_CNC-02','LUBE_ALARM'
   FROM params p
   CROSS JOIN generate_series(date_trunc('day', p.start_ts), date_trunc('day', p.end_ts), interval '1 day') d
 )
@@ -106,7 +135,8 @@ minutes AS (
   SELECT gs AS ts
   FROM params p
   CROSS JOIN generate_series(p.start_ts, p.end_ts, interval '1 minute') gs
-  WHERE EXTRACT(HOUR FROM gs) >= 6 AND EXTRACT(HOUR FROM gs) < 22
+  WHERE EXTRACT(HOUR FROM gs) >= 6
+    AND EXTRACT(HOUR FROM gs) < 22
 ),
 grid AS (
   SELECT
@@ -116,7 +146,6 @@ grid AS (
     c.machine_code,
     c.machine_name,
     c.ideal_cycle_time_s,
-    -- progression 0..1 sur 7 jours
     LEAST(
       1.0,
       GREATEST(0.0, EXTRACT(EPOCH FROM (mn.ts - p.start_ts)) / p.total_span_s)
@@ -142,24 +171,29 @@ computed AS (
     plant_code,
     line_code,
     machine_code,
+    machine_name,
     'P_INJECTOR_PIN'::text AS product_id,
 
     -- scrap probability (story-driven)
     CASE
       WHEN plant_code = 'PLANT_FR_TLS' AND machine_name = 'CNC-01'
-        THEN 0.01 + 0.05 * progress              -- dérive FR CNC-01: 1% → 6%
+        THEN 0.01 + 0.05 * progress          -- dérive FR_TLS CNC-01: 1% -> 6%
       WHEN plant_code = 'PLANT_ES_ZAZ'
-        THEN 0.015                               -- ES un peu plus instable
-      ELSE 0.012
+        THEN 0.015                           -- un peu plus instable
+      WHEN plant_code = 'PLANT_ES_VLC'
+        THEN 0.013                           -- légère variabilité
+      ELSE 0.010                            -- usines de référence plus propres
     END AS scrap_p,
 
-    -- cycle time factor: bruit + dérive sur FR CNC-01
+    -- cycle time factor: bruit + dérive sur FR_TLS CNC-01
     (
       1.0
-      + (random() - 0.5) * 0.08                   -- ±4% noise
+      + (random() - 0.5) * 0.08              -- ±4% noise
       + CASE
           WHEN plant_code = 'PLANT_FR_TLS' AND machine_name = 'CNC-01'
-            THEN 0.20 * progress                  -- jusqu'à +20%
+            THEN 0.20 * progress             -- jusqu'à +20%
+          WHEN plant_code = 'PLANT_ES_ZAZ' AND machine_name = 'CNC-02'
+            THEN 0.04                        -- légère pénalité structurelle
           ELSE 0.0
         END
     ) AS cycle_factor
@@ -167,14 +201,26 @@ computed AS (
 ),
 counts AS (
   SELECT
-    ts, plant_code, line_code, machine_code, product_id,
-    -- total pièces/min (1 ou 2)
+    ts,
+    plant_code,
+    line_code,
+    machine_code,
+    product_id,
     CASE WHEN random() < 0.65 THEN 1 ELSE 2 END AS total_parts,
     scrap_p,
     cycle_factor
   FROM computed
 )
-INSERT INTO production_events (ts, plant_code, line_code, machine_code, product_id, good_count, scrap_count, cycle_time_s)
+INSERT INTO production_events (
+  ts,
+  plant_code,
+  line_code,
+  machine_code,
+  product_id,
+  good_count,
+  scrap_count,
+  cycle_time_s
+)
 SELECT
   ts,
   plant_code,
